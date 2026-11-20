@@ -5,6 +5,7 @@ import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
 
+import '../domain/models/outbox_entry.dart';
 import '../models/consumption_record.dart';
 import '../models/catalog_product.dart';
 import '../models/food_item.dart';
@@ -26,7 +27,7 @@ class InventoryDatabase {
   static InventoryDatabase get instance => _shared;
 
   static const _dbName = 'expira.db';
-  static const _version = 3;
+  static const _version = 4;
   static const _migrationKey = 'legacy_preferences_import_v1';
   static const _itemsKey = 'expira_items';
   static const _recordsKey = 'expira_consumption_records';
@@ -52,6 +53,7 @@ class InventoryDatabase {
       options: OpenDatabaseOptions(
         version: _version,
         onCreate: (db, _) async {
+          // Create v4 schema directly for new databases
           await db.execute('''
             CREATE TABLE items (
               id TEXT PRIMARY KEY,
@@ -65,7 +67,12 @@ class InventoryDatabase {
               brand TEXT,
               purchase_date TEXT,
               image_url TEXT,
-              notes TEXT
+              notes TEXT,
+              sync_status TEXT NOT NULL DEFAULT 'synced',
+              version INTEGER NOT NULL DEFAULT 1,
+              synced_at TEXT,
+              deleted_at TEXT,
+              server_id TEXT
             )
           ''');
           await db.execute(
@@ -78,7 +85,12 @@ class InventoryDatabase {
               category TEXT NOT NULL,
               expiry_date TEXT NOT NULL,
               used_on TEXT NOT NULL,
-              was_expiring_at_use INTEGER NOT NULL
+              was_expiring_at_use INTEGER NOT NULL,
+              sync_status TEXT NOT NULL DEFAULT 'synced',
+              version INTEGER NOT NULL DEFAULT 1,
+              synced_at TEXT,
+              server_id TEXT,
+              record_id TEXT
             )
           ''');
           await db.execute('''
@@ -88,6 +100,24 @@ class InventoryDatabase {
             )
           ''');
           await _createCatalog(db);
+
+          // Create outbox table
+          await db.execute('''
+            CREATE TABLE outbox (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              operation TEXT NOT NULL,
+              entity_type TEXT NOT NULL,
+              entity_id TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              expected_version INTEGER NOT NULL,
+              created_at TEXT NOT NULL,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT,
+              status TEXT NOT NULL DEFAULT 'pending'
+            )
+          ''');
+          await db.execute('CREATE INDEX outbox_status_idx ON outbox(status)');
+          await db.execute('CREATE INDEX outbox_entity_idx ON outbox(entity_type, entity_id)');
         },
         onUpgrade: (db, oldVersion, newVersion) async {
           if (oldVersion < 2) {
@@ -99,6 +129,53 @@ class InventoryDatabase {
             await db.execute('ALTER TABLE items ADD COLUMN purchase_date TEXT');
             await db.execute('ALTER TABLE items ADD COLUMN image_url TEXT');
             await db.execute('ALTER TABLE items ADD COLUMN notes TEXT');
+          }
+          if (oldVersion < 4) {
+            // v3 -> v4: Add sync metadata columns for offline-first sync
+            await db.execute('ALTER TABLE items ADD COLUMN sync_status TEXT NOT NULL DEFAULT "synced"');
+            await db.execute('ALTER TABLE items ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
+            await db.execute('ALTER TABLE items ADD COLUMN synced_at TEXT');
+            await db.execute('ALTER TABLE items ADD COLUMN deleted_at TEXT');
+            await db.execute('ALTER TABLE items ADD COLUMN server_id TEXT');
+
+            // Backfill defaults for existing rows (SQLite doesn't backfill DEFAULT on ALTER TABLE)
+            await db.execute('UPDATE items SET sync_status = "synced" WHERE sync_status IS NULL');
+            await db.execute('UPDATE items SET version = 1 WHERE version IS NULL');
+
+            await db.execute('ALTER TABLE consumption_records ADD COLUMN sync_status TEXT NOT NULL DEFAULT "synced"');
+            await db.execute('ALTER TABLE consumption_records ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
+            await db.execute('ALTER TABLE consumption_records ADD COLUMN synced_at TEXT');
+            await db.execute('ALTER TABLE consumption_records ADD COLUMN server_id TEXT');
+            await db.execute('ALTER TABLE consumption_records ADD COLUMN record_id TEXT');
+
+            // Backfill defaults for existing rows
+            await db.execute('UPDATE consumption_records SET sync_status = "synced" WHERE sync_status IS NULL');
+            await db.execute('UPDATE consumption_records SET version = 1 WHERE version IS NULL');
+
+            // Backfill record_id for existing consumption records
+            final records = await db.query('consumption_records', columns: ['id', 'item_name', 'used_on']);
+            for (final r in records) {
+              final recordId = _generateRecordId(r['id'] as int, r['item_name'] as String, r['used_on'] as String);
+              await db.update('consumption_records', {'record_id': recordId}, where: 'id = ?', whereArgs: [r['id']]);
+            }
+
+            // Create outbox table
+            await db.execute('''
+              CREATE TABLE outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                expected_version INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                status TEXT NOT NULL DEFAULT 'pending'
+              )
+            ''');
+            await db.execute('CREATE INDEX outbox_status_idx ON outbox(status)');
+            await db.execute('CREATE INDEX outbox_entity_idx ON outbox(entity_type, entity_id)');
           }
         },
       ),
@@ -341,6 +418,154 @@ class InventoryDatabase {
     });
   }
 
+  /// Upserts a single item with an outbox entry (create or update).
+  /// Used for granular mutations that need sync tracking.
+  Future<void> upsertItemWithOutbox({
+    required FoodItem item,
+    required OutboxOperation operation,
+  }) async {
+    if (kIsWeb) {
+      await _upsertItemWithOutboxWeb(item, operation);
+      return;
+    }
+    final db = await database;
+    await db.transaction((txn) async {
+      // Read current version for optimistic locking
+      final current = await txn.query('items', where: 'id = ?', whereArgs: [item.id], limit: 1);
+      final currentVersion = current.isEmpty ? 0 : (current.first['version'] as int? ?? 1);
+      final newVersion = currentVersion + 1;
+
+      // Upsert item with new version and pending sync status
+      // Note: legacy FoodItem doesn't have version/syncStatus/updatedAt - they're stored in DB row
+      final itemRow = _itemToRow(item)..['version'] = newVersion..['sync_status'] = 'pending';
+      await txn.insert('items', itemRow, conflictAlgorithm: ConflictAlgorithm.replace);
+
+      // Write outbox entry
+      final outboxRow = _outboxToRow(
+        operation: operation,
+        entityType: const OutboxEntityType.item(),
+        entityId: item.id,
+        payload: jsonEncode(item.toJson()),
+        expectedVersion: newVersion,
+      );
+      await txn.insert('outbox', outboxRow);
+    });
+  }
+
+  /// Soft deletes an item with an outbox entry.
+  Future<void> softDeleteItemWithOutbox(String itemId) async {
+    if (kIsWeb) {
+      await _softDeleteItemWithOutboxWeb(itemId);
+      return;
+    }
+    final db = await database;
+    await db.transaction((txn) async {
+      // Read current version
+      final current = await txn.query('items', where: 'id = ?', whereArgs: [itemId], limit: 1);
+      if (current.isEmpty) return; // Already gone
+      final currentVersion = (current.first['version'] as int? ?? 1);
+      final newVersion = currentVersion + 1;
+      final deletedAt = DateTime.now().toUtc().toIso8601String();
+
+      // Soft delete: set deleted_at, increment version, mark pending
+      await txn.update('items', {
+        'deleted_at': deletedAt,
+        'version': newVersion,
+        'sync_status': 'pending',
+      }, where: 'id = ?', whereArgs: [itemId]);
+
+      // Write outbox entry
+      final outboxRow = _outboxToRow(
+        operation: const OutboxOperation.delete(),
+        entityType: const OutboxEntityType.item(),
+        entityId: itemId,
+        payload: jsonEncode({'id': itemId, 'deletedAt': deletedAt, 'version': newVersion}),
+        expectedVersion: newVersion,
+      );
+      await txn.insert('outbox', outboxRow);
+    });
+  }
+
+  /// Atomically updates/removes the item, appends consumption record, and writes outbox.
+  Future<void> recordUseWithOutbox({
+    required String itemId,
+    required FoodItem? remainingItem,
+    required ConsumptionRecord record,
+  }) async {
+    if (kIsWeb) {
+      await _recordUseWithOutboxWeb(itemId: itemId, remainingItem: remainingItem, record: record);
+      return;
+    }
+    final db = await database;
+    await db.transaction((txn) async {
+      if (remainingItem == null) {
+        // Item fully consumed - soft delete
+        final current = await txn.query('items', where: 'id = ?', whereArgs: [itemId], limit: 1);
+        if (current.isNotEmpty) {
+          final currentVersion = (current.first['version'] as int? ?? 1);
+          final newVersion = currentVersion + 1;
+          final deletedAt = DateTime.now().toUtc().toIso8601String();
+
+          await txn.update('items', {
+            'deleted_at': deletedAt,
+            'version': newVersion,
+            'sync_status': 'pending',
+          }, where: 'id = ?', whereArgs: [itemId]);
+
+          // Outbox for item deletion
+          final itemOutboxRow = _outboxToRow(
+            operation: const OutboxOperation.delete(),
+            entityType: const OutboxEntityType.item(),
+            entityId: itemId,
+            payload: jsonEncode({'id': itemId, 'deletedAt': deletedAt, 'version': newVersion}),
+            expectedVersion: newVersion,
+          );
+          await txn.insert('outbox', itemOutboxRow);
+        }
+      } else {
+        // Item partially consumed - update quantity
+        final current = await txn.query('items', where: 'id = ?', whereArgs: [itemId], limit: 1);
+        final currentVersion = current.isEmpty ? 0 : (current.first['version'] as int? ?? 1);
+        final newVersion = currentVersion + 1;
+
+        final itemRow = _itemToRow(remainingItem)..['version'] = newVersion..['sync_status'] = 'pending';
+        await txn.update('items', itemRow, where: 'id = ?', whereArgs: [itemId]);
+
+        // Outbox for item update
+        final itemOutboxRow = _outboxToRow(
+          operation: const OutboxOperation.update(),
+          entityType: const OutboxEntityType.item(),
+          entityId: itemId,
+          payload: jsonEncode(remainingItem.toJson()),
+          expectedVersion: newVersion,
+        );
+        await txn.insert('outbox', itemOutboxRow);
+      }
+
+      // Insert consumption record
+      final recordRow = _recordToRow(record);
+      await txn.insert('consumption_records', recordRow);
+
+      // Get the auto-generated row ID for deterministic record ID generation
+      final recordIdResult = await txn.rawQuery('SELECT last_insert_rowid() as id');
+      final recordRowId = recordIdResult.first['id'] as int;
+      final deterministicRecordId = _generateRecordId(recordRowId, record.itemName, record.usedOn.toIso8601String());
+
+      // Update the record with the generated record_id
+      await txn.update('consumption_records', {'record_id': deterministicRecordId}, where: 'id = ?', whereArgs: [recordRowId]);
+
+      // Outbox for consumption record creation (legacy records have version 1)
+      final recordOutboxRow = _outboxToRow(
+        operation: const OutboxOperation.markUsed(),
+        entityType: const OutboxEntityType.consumption(),
+        entityId: deterministicRecordId,
+        payload: jsonEncode(record.toJson()),
+        expectedVersion: 1,
+      );
+      await txn.insert('outbox', recordOutboxRow);
+    });
+  }
+
   Future<void> close() async {
     final opened = _database;
     _database = null;
@@ -359,12 +584,56 @@ class InventoryDatabase {
       if (decoded is! Map) {
         throw const FormatException('Browser inventory data is invalid.');
       }
+
+      // Migration: add default sync fields to existing web data (v3 -> v4)
+      final itemsJson = decoded['items'] as List? ?? [];
+      final recordsJson = decoded['records'] as List? ?? [];
+
+      // Add sync fields to items if missing
+      final migratedItems = itemsJson.map((item) {
+        if (item is Map && !item.containsKey('syncStatus')) {
+          return Map<String, dynamic>.from(item)
+            ..addAll({
+              'syncStatus': 'synced',
+              'version': 1,
+              'syncedAt': null,
+              'deletedAt': null,
+              'serverId': '',
+            });
+        }
+        return item;
+      }).toList();
+
+      // Add sync fields to records if missing
+      final migratedRecords = recordsJson.map((record) {
+        if (record is Map && !record.containsKey('syncStatus')) {
+          return Map<String, dynamic>.from(record)
+            ..addAll({
+              'syncStatus': 'synced',
+              'version': 1,
+              'syncedAt': null,
+              'serverId': '',
+              'id': record['id'] ?? _generateRecordId(
+                record['rowId'] as int? ?? 0,
+                record['itemName'] as String? ?? '',
+                record['usedOn'] as String? ?? DateTime.now().toIso8601String(),
+              ),
+            });
+        }
+        return record;
+      }).toList();
+
+      // Save migrated data back
+      if (migratedItems != itemsJson || migratedRecords != recordsJson) {
+        await _saveWebData(
+          _decodeStoredList(migratedItems, FoodItem.fromJson),
+          _decodeStoredList(migratedRecords, ConsumptionRecord.fromJson),
+        );
+      }
+
       return (
-        items: _decodeStoredList(decoded['items'], FoodItem.fromJson),
-        records: _decodeStoredList(
-          decoded['records'],
-          ConsumptionRecord.fromJson,
-        ),
+        items: _decodeStoredList(migratedItems, FoodItem.fromJson),
+        records: _decodeStoredList(migratedRecords, ConsumptionRecord.fromJson),
       );
     }
 
@@ -415,6 +684,18 @@ class InventoryDatabase {
     }
   }
 
+  /// Generates a deterministic record ID for consumption records.
+  /// Uses rowId + itemName + usedOn to create a stable hash.
+  static String _generateRecordId(int rowId, String itemName, String usedOn) {
+    final input = '$rowId|$itemName|$usedOn';
+    int hash = 0;
+    for (final codeUnit in input.codeUnits) {
+      hash = ((hash << 5) - hash) + codeUnit;
+      hash = hash & 0xFFFFFFFF; // 32-bit
+    }
+    return 'rec_${hash.abs().toRadixString(16).padLeft(8, '0')}';
+  }
+
   static Map<String, Object?> _itemToRow(FoodItem item) => {
         'id': item.id,
         'name': item.name,
@@ -428,6 +709,12 @@ class InventoryDatabase {
         'purchase_date': item.purchaseDate?.toIso8601String(),
         'image_url': item.imageUrl,
         'notes': item.notes,
+        // Sync columns - use defaults for legacy model
+        'sync_status': 'synced',
+        'version': 1,
+        'synced_at': null,
+        'deleted_at': null,
+        'server_id': '',
       };
 
   static FoodItem _itemFromRow(Map<String, Object?> row) => FoodItem(
@@ -445,6 +732,8 @@ class InventoryDatabase {
             : DateTime.parse(row['purchase_date']! as String),
         imageUrl: row['image_url'] as String?,
         notes: row['notes'] as String?,
+        // Sync columns are stored in DB but not in legacy model
+        // Domain mapper will handle conversion
       );
 
   static Map<String, Object?> _recordToRow(ConsumptionRecord record) => {
@@ -453,6 +742,12 @@ class InventoryDatabase {
         'expiry_date': record.expiryDate.toIso8601String(),
         'used_on': record.usedOn.toIso8601String(),
         'was_expiring_at_use': record.wasExpiringAtUse ? 1 : 0,
+        // Sync columns - use defaults for legacy model
+        'sync_status': 'synced',
+        'version': 1,
+        'synced_at': null,
+        'server_id': '',
+        'record_id': '', // legacy doesn't have id, will be backfilled on migration
       };
 
   static ConsumptionRecord _recordFromRow(Map<String, Object?> row) =>
@@ -462,5 +757,69 @@ class InventoryDatabase {
         expiryDate: DateTime.parse(row['expiry_date']! as String),
         usedOn: DateTime.parse(row['used_on']! as String),
         wasExpiringAtUse: row['was_expiring_at_use'] == 1,
+        // Sync columns are stored in DB but not in legacy model
       );
+
+  /// Converts outbox entry data to a database row.
+  static Map<String, Object?> _outboxToRow({
+    required OutboxOperation operation,
+    required OutboxEntityType entityType,
+    required String entityId,
+    required String payload,
+    required int expectedVersion,
+  }) => {
+        'operation': operation.value,
+        'entity_type': entityType.value,
+        'entity_id': entityId,
+        'payload': payload,
+        'expected_version': expectedVersion,
+        'created_at': DateTime.now().toUtc().toIso8601String(),
+        'retry_count': 0,
+        'last_error': '',
+        'status': const OutboxStatus.pending().value,
+      };
+
+  /// Web implementation: upsert item with outbox entry.
+  /// Since web uses SharedPreferences, we simulate by just doing the mutation.
+  Future<void> _upsertItemWithOutboxWeb(FoodItem item, OutboxOperation operation) async {
+    final current = await _loadWebData();
+    final updatedItems = <FoodItem>[];
+    for (final existing in current.items) {
+      if (existing.id != item.id) {
+        updatedItems.add(existing);
+      }
+    }
+    updatedItems.add(item);
+    await _saveWebData(updatedItems, current.records);
+  }
+
+  /// Web implementation: soft delete item with outbox entry.
+  Future<void> _softDeleteItemWithOutboxWeb(String itemId) async {
+    final current = await _loadWebData();
+    final updatedItems = <FoodItem>[];
+    for (final existing in current.items) {
+      if (existing.id != itemId) {
+        updatedItems.add(existing);
+      }
+    }
+    await _saveWebData(updatedItems, current.records);
+  }
+
+  /// Web implementation: record use with outbox entry.
+  Future<void> _recordUseWithOutboxWeb({
+    required String itemId,
+    required FoodItem? remainingItem,
+    required ConsumptionRecord record,
+  }) async {
+    final current = await _loadWebData();
+    final updatedItems = <FoodItem>[];
+    for (final item in current.items) {
+      if (item.id != itemId) {
+        updatedItems.add(item);
+      } else if (remainingItem != null) {
+        updatedItems.add(remainingItem);
+      }
+    }
+    await _saveWebData(updatedItems, [...current.records, record]);
+  }
 }

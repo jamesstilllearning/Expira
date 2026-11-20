@@ -1,36 +1,33 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
-import '../controllers/inventory_controller.dart';
-import '../controllers/settings_controller.dart';
-import '../models/app_settings.dart';
+import '../core/constants/app_constants.dart';
+import '../core/utils/date_utils.dart' as app_date_utils;
+import '../domain/models/app_settings.dart';
+import '../domain/models/reminder_schedule.dart';
+import '../presentation/providers/state_providers.dart';
+import '../presentation/providers/usecase_providers.dart';
 import '../services/backup_service.dart';
 import '../services/consumption_storage.dart';
 import '../services/item_storage.dart';
 import '../services/notification_service.dart';
-import '../widgets/pop_in.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
+import '../widgets/pop_in.dart';
 import '../widgets/section_header.dart';
 
-class SettingsScreen extends StatelessWidget {
-  const SettingsScreen({
-    super.key,
-    required this.controller,
-    required this.inventory,
-    required this.notifications,
-  });
+/// Settings screen using Riverpod for state management and go_router for navigation.
+class SettingsScreen extends ConsumerWidget {
+  const SettingsScreen({super.key});
 
-  final SettingsController controller;
-  final InventoryController inventory;
-  final NotificationService notifications;
-
-  Future<bool> _exportBackup(BuildContext context,
-      {bool showMessage = true}) async {
+  Future<bool> _exportBackup(BuildContext context, {bool showMessage = true}) async {
     final service = BackupService(
       items: ItemStorage(),
       records: ConsumptionStorage(),
@@ -56,7 +53,7 @@ class SettingsScreen extends StatelessWidget {
     return true;
   }
 
-  Future<void> _restoreBackup(BuildContext context) async {
+  Future<void> _restoreBackup(BuildContext context, WidgetRef ref) async {
     try {
       final picked = await FilePicker.pickFile(
         type: FileType.custom,
@@ -96,28 +93,29 @@ class SettingsScreen extends StatelessWidget {
           false;
       if (!confirmed || !context.mounted) return;
 
-      final safetyBackupSaved =
-          await _exportBackup(context, showMessage: false);
+      final safetyBackupSaved = await _exportBackup(context, showMessage: false);
       if (!safetyBackupSaved || !context.mounted) {
         if (context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: PopIn(
-                child: Text(
-                  'Restore cancelled because the safety backup was not saved.',
-                ),
-              ),
-            ),
+            const SnackBar(content: PopIn(child: Text('Restore cancelled because the safety backup was not saved.'))),
           );
         }
         return;
       }
 
-      await inventory.replaceAll(items: backup.items, records: backup.records);
+      final replaceAllUseCase = ref.read(replaceAllFoodItemsUseCaseProvider);
+      final result = await replaceAllUseCase(backup.items);
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: PopIn(child: Text('Backup restored.'))),
-      );
+
+      if (result.isSuccess) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: PopIn(child: Text('Backup restored.'))),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: PopIn(child: Text('Failed to restore: ${result.failure?.message}'))),
+        );
+      }
     } on FormatException catch (error) {
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -127,43 +125,43 @@ class SettingsScreen extends StatelessWidget {
     } catch (_) {
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-              content: PopIn(
-                  child: Text(
-                      'Could not restore that backup. No data was replaced.'))),
+          const SnackBar(content: PopIn(child: Text('Could not restore that backup. No data was replaced.'))),
         );
       }
     }
   }
 
-  Future<void> _setReminders(BuildContext context, bool enabled) async {
+  Future<void> _setReminders(BuildContext context, WidgetRef ref, bool enabled) async {
+    final notifications = NotificationService();
     if (enabled) {
       final granted = await notifications.requestPermission();
       if (!granted) {
         if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: PopIn(
-              child: Text(
-                'Allow notifications in Android Settings > Apps > ExPIRA > Notifications, then turn reminders on again.',
-              ),
-            ),
-          ));
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: PopIn(child: Text('Allow notifications in Android Settings > Apps > ExPIRA > Notifications, then turn reminders on again.'))));
         }
         return;
       }
     }
-    await controller
-        .apply(controller.settings.copyWith(remindersEnabled: enabled));
+    final settingsAsync = ref.read(appSettingsFutureProvider);
+    final currentSettings = (await settingsAsync).getOrElse(() => const AppSettings());
+    final saveUseCase = ref.read(saveAppSettingsUseCaseProvider);
+    await saveUseCase(currentSettings.copyWith(remindersEnabled: enabled));
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final settingsAsync = ref.watch(appSettingsStreamProvider);
+
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
-      body: ListenableBuilder(
-        listenable: controller,
-        builder: (context, _) {
-          final s = controller.settings;
+      body: settingsAsync.when(
+        loading: () => const Center(child: CircularProgressIndicator()),
+        error: (error, stack) => _ErrorState(
+          message: 'Failed to load settings',
+          onRetry: () => ref.invalidate(appSettingsStreamProvider),
+        ),
+        data: (result) {
+          final s = result.getOrElse(() => const AppSettings());
           return ListView(
             padding: const EdgeInsets.fromLTRB(20, 8, 20, 32),
             children: [
@@ -182,11 +180,9 @@ class SettingsScreen extends StatelessWidget {
                     icon: Icons.flashlight_on_outlined,
                     color: AppColors.soon,
                     title: 'Auto flashlight',
-                    subtitle:
-                        'Turn on the flashlight when scanning in the dark',
+                    subtitle: 'Turn on the flashlight when scanning in the dark',
                     value: s.autoFlashlight,
-                    onChanged: (v) =>
-                        controller.apply(s.copyWith(autoFlashlight: v)),
+                    onChanged: (v) => _updateSettings(ref, s.copyWith(autoFlashlight: v)),
                   ),
                 _SettingTile(
                   icon: Icons.celebration_outlined,
@@ -194,8 +190,7 @@ class SettingsScreen extends StatelessWidget {
                   title: 'Celebration effects',
                   subtitle: 'Celebrate when you use an item before it expires',
                   value: s.celebrationEffects,
-                  onChanged: (v) =>
-                      controller.apply(s.copyWith(celebrationEffects: v)),
+                  onChanged: (v) => _updateSettings(ref, s.copyWith(celebrationEffects: v)),
                 ),
                 _SettingTile(
                   icon: Icons.tune,
@@ -205,8 +200,7 @@ class SettingsScreen extends StatelessWidget {
                       ? 'Warn 2 days before expiry'
                       : 'Warn only 1 day before expiry',
                   value: s.strictThresholds,
-                  onChanged: (v) =>
-                      controller.apply(s.copyWith(strictThresholds: v)),
+                  onChanged: (v) => _updateSettings(ref, s.copyWith(strictThresholds: v)),
                 ),
               ]),
               const SizedBox(height: AppSpacing.xl),
@@ -216,28 +210,22 @@ class SettingsScreen extends StatelessWidget {
                   const ListTile(
                     leading: Icon(Icons.notifications_off_outlined),
                     title: Text('Expiry reminders'),
-                    subtitle: Text(
-                      'Scheduled reminders are available in the Android app only.',
-                    ),
+                    subtitle: Text('Scheduled reminders are available in the Android app only.'),
                   )
                 else
                   _SettingTile(
                     icon: Icons.notifications_active_outlined,
                     color: AppColors.brand,
                     title: 'Expiry reminders',
-                    subtitle:
-                        'Notify me when items start expiring and on the day they expire',
+                    subtitle: 'Notify me when items start expiring and on the day they expire',
                     value: s.remindersEnabled,
-                    onChanged: (enabled) => _setReminders(context, enabled),
+                    onChanged: (enabled) => _setReminders(context, ref, enabled),
                   ),
                 if (!kIsWeb && s.remindersEnabled)
                   _ReminderScheduleTile(
                     settings: s,
                     onChanged: (schedule, hour) =>
-                        controller.apply(s.copyWith(
-                          reminderSchedule: schedule,
-                          reminderHour: hour,
-                        )),
+                        _updateSettings(ref, s.copyWith(reminderSchedule: schedule, reminderHour: hour)),
                   ),
               ]),
               const SizedBox(height: AppSpacing.xl),
@@ -249,7 +237,7 @@ class SettingsScreen extends StatelessWidget {
                   title: 'Dark mode',
                   subtitle: 'Use the dark theme across the app',
                   value: s.darkMode,
-                  onChanged: (v) => controller.apply(s.copyWith(darkMode: v)),
+                  onChanged: (v) => _updateSettings(ref, s.copyWith(darkMode: v)),
                 ),
               ]),
               const SizedBox(height: AppSpacing.xl),
@@ -266,17 +254,13 @@ class SettingsScreen extends StatelessWidget {
                 ListTile(
                   leading: const Icon(Icons.download_outlined),
                   title: const Text('Export backup'),
-                  subtitle: const Text(
-                    'Save inventory and usage history as a JSON file',
-                  ),
+                  subtitle: const Text('Save inventory and usage history as a JSON file'),
                   onTap: () async {
                     try {
                       await _exportBackup(context);
                     } catch (_) {
                       if (context.mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: PopIn(child: Text('Could not save the backup.'))),
-                        );
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: PopIn(child: Text('Could not save the backup.'))));
                       }
                     }
                   },
@@ -284,15 +268,49 @@ class SettingsScreen extends StatelessWidget {
                 ListTile(
                   leading: const Icon(Icons.restore_outlined),
                   title: const Text('Restore backup'),
-                  subtitle: const Text(
-                    'Replace this device\'s inventory and usage history',
-                  ),
-                  onTap: () => _restoreBackup(context),
+                  subtitle: const Text('Replace this device\'s inventory and usage history'),
+                  onTap: () => _restoreBackup(context, ref),
                 ),
               ]),
             ],
           );
         },
+      ),
+    );
+  }
+
+  Future<void> _updateSettings(WidgetRef ref, AppSettings settings) async {
+    final saveUseCase = ref.read(saveAppSettingsUseCaseProvider);
+    await saveUseCase(settings);
+  }
+}
+
+/// Error state widget
+class _ErrorState extends StatelessWidget {
+  const _ErrorState({
+    required this.message,
+    required this.onRetry,
+  });
+
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.xl),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.error_outline, size: 64, color: theme.colorScheme.error),
+            const SizedBox(height: AppSpacing.md),
+            Text(message, style: theme.textTheme.titleMedium, textAlign: TextAlign.center),
+            const SizedBox(height: AppSpacing.lg),
+            FilledButton(onPressed: onRetry, child: const Text('Retry')),
+          ],
+        ),
       ),
     );
   }
@@ -321,8 +339,7 @@ class _SyncCard extends StatelessWidget {
               color: theme.colorScheme.primaryContainer,
               borderRadius: BorderRadius.circular(AppRadius.control),
             ),
-            child: Icon(Icons.cloud_outlined,
-                color: theme.colorScheme.onPrimaryContainer),
+            child: Icon(Icons.cloud_outlined, color: theme.colorScheme.onPrimaryContainer),
           ),
           const SizedBox(width: 14),
           Expanded(
@@ -341,8 +358,7 @@ class _SyncCard extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 8),
-          Icon(Icons.schedule_outlined,
-              size: 20, color: theme.colorScheme.onSurfaceVariant),
+          Icon(Icons.schedule_outlined, size: 20, color: theme.colorScheme.onSurfaceVariant),
         ],
       ),
     );
@@ -411,11 +427,7 @@ class _SettingTile extends StatelessWidget {
         child: Icon(icon, color: color, size: AppIconSize.md),
       ),
       title: Text(title, style: theme.textTheme.titleMedium),
-      subtitle: Text(
-        subtitle,
-        style: theme.textTheme.bodySmall
-            ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-      ),
+      subtitle: Text(subtitle, style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
       trailing: Switch(
         value: value,
         onChanged: (v) {
@@ -433,8 +445,6 @@ class _SettingTile extends StatelessWidget {
 
 // Custom callback types for multi-parameter callbacks
 typedef ScheduleChangedCallback = void Function(List<ReminderScheduleItem> schedule, int hour);
-typedef DaysChangedCallback = void Function(int index, int days);
-typedef LabelChangedCallback = void Function(int index, String label);
 
 /// Tile for configuring the reminder schedule (which days before expiry to notify)
 class _ReminderScheduleTile extends StatefulWidget {
@@ -511,11 +521,7 @@ class _ReminderScheduleTileState extends State<_ReminderScheduleTile> {
     if (newDays > 90) newDays = 90;
 
     setState(() {
-      _schedule.add(ReminderScheduleItem(
-        daysBefore: newDays,
-        enabled: true,
-        label: '$newDays days before',
-      ));
+      _schedule.add(ReminderScheduleItem(daysBefore: newDays, enabled: true, label: '$newDays days before'));
       // Keep sorted by daysBefore descending
       _schedule.sort((a, b) => b.daysBefore.compareTo(a.daysBefore));
     });
@@ -543,15 +549,10 @@ class _ReminderScheduleTileState extends State<_ReminderScheduleTile> {
           color: AppColors.brand.withValues(alpha: 0.14),
           borderRadius: BorderRadius.circular(AppRadius.control),
         ),
-        child: const Icon(Icons.schedule_outlined,
-            color: AppColors.brand, size: AppIconSize.md),
+        child: const Icon(Icons.schedule_outlined, color: AppColors.brand, size: AppIconSize.md),
       ),
       title: Text('Reminder schedule', style: theme.textTheme.titleMedium),
-      subtitle: Text(
-        'Choose when to be notified before items expire',
-        style: theme.textTheme.bodySmall
-            ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-      ),
+      subtitle: Text('Choose when to be notified before items expire', style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
       children: [
         // Reminder hour picker
         ListTile(
@@ -562,15 +563,10 @@ class _ReminderScheduleTileState extends State<_ReminderScheduleTile> {
               color: AppColors.soon.withValues(alpha: 0.14),
               borderRadius: BorderRadius.circular(AppRadius.control),
             ),
-            child:
-                const Icon(Icons.access_time_outlined, color: AppColors.soon, size: 20),
+            child: const Icon(Icons.access_time_outlined, color: AppColors.soon, size: 20),
           ),
           title: const Text('Notification time'),
-          subtitle: Text(
-            'Reminders will be sent at ${_reminderHour.toString().padLeft(2, '0')}:00',
-            style: theme.textTheme.bodySmall
-                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-          ),
+          subtitle: Text('Reminders will be sent at ${_reminderHour.toString().padLeft(2, '0')}:00', style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
           onTap: _pickHour,
           trailing: const Icon(Icons.chevron_right),
         ),
@@ -597,11 +593,7 @@ class _ReminderScheduleTileState extends State<_ReminderScheduleTile> {
             child: const Icon(Icons.add_outlined, color: AppColors.brand, size: 20),
           ),
           title: const Text('Add reminder'),
-          subtitle: Text(
-            'Notify at a custom number of days before expiry',
-            style: theme.textTheme.bodySmall
-                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-          ),
+          subtitle: Text('Notify at a custom number of days before expiry', style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
           onTap: _addReminder,
         ),
       ],
@@ -622,13 +614,12 @@ class _ReminderScheduleItemTile extends StatefulWidget {
   final int index;
   final ReminderScheduleItem item;
   final ValueChanged<int> onToggleEnabled;
-  final DaysChangedCallback onChangeDays;
-  final LabelChangedCallback onChangeLabel;
+  final void Function(int index, int newDays) onChangeDays;
+  final void Function(int index, String newLabel) onChangeLabel;
   final VoidCallback? onRemove;
 
   @override
-  State<_ReminderScheduleItemTile> createState() =>
-      _ReminderScheduleItemTileState();
+  State<_ReminderScheduleItemTile> createState() => _ReminderScheduleItemTileState();
 }
 
 class _ReminderScheduleItemTileState extends State<_ReminderScheduleItemTile> {
@@ -641,7 +632,7 @@ class _ReminderScheduleItemTileState extends State<_ReminderScheduleItemTile> {
   void initState() {
     super.initState();
     _daysController = TextEditingController(text: widget.item.daysBefore.toString());
-    _labelController = TextEditingController(text: widget.item.label ?? '');
+    _labelController = TextEditingController(text: widget.item.label);
   }
 
   @override
@@ -684,19 +675,11 @@ class _ReminderScheduleItemTileState extends State<_ReminderScheduleItemTile> {
           color: statusColor.withValues(alpha: 0.14),
           borderRadius: BorderRadius.circular(AppRadius.control),
         ),
-        child: Icon(
-          isExpiryDay ? Icons.event_available : Icons.schedule_outlined,
-          color: statusColor,
-          size: 20,
-        ),
+        child: Icon(isExpiryDay ? Icons.event_available : Icons.schedule_outlined, color: statusColor, size: 20),
       ),
       title: Row(
         children: [
-          Checkbox(
-            value: widget.item.enabled,
-            onChanged: (_) => widget.onToggleEnabled(widget.index),
-            activeColor: AppColors.brand,
-          ),
+          Checkbox(value: widget.item.enabled, onChanged: (_) => widget.onToggleEnabled(widget.index), activeColor: AppColors.brand),
           const SizedBox(width: 8),
           Expanded(
             child: _editingDays
@@ -706,11 +689,7 @@ class _ReminderScheduleItemTileState extends State<_ReminderScheduleItemTile> {
                       controller: _daysController,
                       autofocus: true,
                       keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(
-                        isDense: true,
-                        hintText: 'Days',
-                        border: OutlineInputBorder(),
-                      ),
+                      decoration: const InputDecoration(isDense: true, hintText: 'Days', border: OutlineInputBorder()),
                       onSubmitted: (_) => _submitDays(),
                       onEditingComplete: _submitDays,
                     ),
@@ -718,9 +697,7 @@ class _ReminderScheduleItemTileState extends State<_ReminderScheduleItemTile> {
                 : Text(
                     _getDisplayLabel(),
                     style: theme.textTheme.titleMedium?.copyWith(
-                      color: widget.item.enabled
-                          ? theme.colorScheme.onSurface
-                          : theme.colorScheme.onSurfaceVariant,
+                      color: widget.item.enabled ? theme.colorScheme.onSurface : theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
           ),
@@ -730,20 +707,12 @@ class _ReminderScheduleItemTileState extends State<_ReminderScheduleItemTile> {
           ? TextField(
               controller: _labelController,
               autofocus: true,
-              decoration: const InputDecoration(
-                isDense: true,
-                hintText: 'Custom label (optional)',
-                border: OutlineInputBorder(),
-              ),
+              decoration: const InputDecoration(isDense: true, hintText: 'Custom label (optional)', border: OutlineInputBorder()),
               onSubmitted: (_) => _submitLabel(),
               onEditingComplete: _submitLabel,
             )
-          : widget.item.label != null && widget.item.label!.isNotEmpty
-              ? Text(
-                  widget.item.label!,
-                  style: theme.textTheme.bodySmall
-                      ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-                )
+          : widget.item.label.isNotEmpty
+              ? Text(widget.item.label, style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant))
               : null,
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
@@ -752,22 +721,19 @@ class _ReminderScheduleItemTileState extends State<_ReminderScheduleItemTile> {
             IconButton(
               tooltip: 'Edit days',
               onPressed: () => setState(() => _editingDays = true),
-              icon: Icon(Icons.edit_outlined,
-                  size: 20, color: theme.colorScheme.onSurfaceVariant),
+              icon: Icon(Icons.edit_outlined, size: 20, color: theme.colorScheme.onSurfaceVariant),
             ),
-          if (!_editingLabel && widget.item.label != null)
+          if (!_editingLabel && widget.item.label.isNotEmpty)
             IconButton(
               tooltip: 'Edit label',
               onPressed: () => setState(() => _editingLabel = true),
-              icon: Icon(Icons.edit_outlined,
-                  size: 20, color: theme.colorScheme.onSurfaceVariant),
+              icon: Icon(Icons.edit_outlined, size: 20, color: theme.colorScheme.onSurfaceVariant),
             ),
           if (widget.onRemove != null)
             IconButton(
               tooltip: 'Remove',
               onPressed: widget.onRemove,
-              icon: Icon(Icons.delete_outline,
-                  size: 20, color: theme.colorScheme.error),
+              icon: Icon(Icons.delete_outline, size: 20, color: theme.colorScheme.error),
             ),
         ],
       ),

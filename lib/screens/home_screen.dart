@@ -1,16 +1,23 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
-import '../controllers/inventory_controller.dart';
-import '../models/food_item.dart';
-import '../models/impact_stats.dart';
+import '../core/constants/app_constants.dart';
+import '../core/utils/date_utils.dart' as app_date_utils;
+import '../core/utils/string_utils.dart';
+import '../domain/models/expiry_status.dart';
+import '../domain/models/food_item.dart';
+import '../domain/models/impact_stats.dart';
+import '../presentation/providers/state_providers.dart';
+import '../presentation/providers/usecase_providers.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_loading_indicator.dart';
 import '../widgets/app_card.dart';
 import '../widgets/impact_panel.dart';
-import '../services/daily_message.dart';
 import '../widgets/daily_companion.dart';
-import '../widgets/empty_state.dart';
+import '../widgets/empty_state.dart'
+    hide EmptyState; // Use our local _EmptyState instead
 import '../widgets/sky_backdrop.dart';
 import '../widgets/inventory_health_card.dart';
 import '../widgets/item_card.dart';
@@ -18,62 +25,66 @@ import '../widgets/section_header.dart';
 import 'item_form_screen.dart';
 import 'item_detail_screen.dart';
 
-class HomeScreen extends StatelessWidget {
-  const HomeScreen({
-    super.key,
-    required this.controller,
-    required this.onOpenInventory,
-    required this.onOpenSettings,
-    required this.onScanBarcode,
-    required this.onOpenCalendar,
-    required this.onOpenNotifications,
-  });
-
-  final InventoryController controller;
-  final VoidCallback onOpenInventory;
-  final VoidCallback onOpenSettings;
-  final VoidCallback onScanBarcode;
-  final VoidCallback onOpenCalendar;
-  final VoidCallback onOpenNotifications;
+/// Home screen using Riverpod for state management and go_router for navigation.
+class HomeScreen extends ConsumerWidget {
+  const HomeScreen({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: ListenableBuilder(
-        listenable: controller,
-        builder: (context, _) {
-          if (!controller.isLoaded) {
-            return const AppLoadingIndicator(
-              showText: true,
-              text: 'Loading your inventory...',
-            );
-          }
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Watch the food items stream from the repository
+    final itemsAsync = ref.watch(foodItemsStreamProvider);
+    final settingsAsync = ref.watch(appSettingsStreamProvider);
 
-          final items = controller.items;
-          final prioritized = controller.prioritized;
+    return Scaffold(
+      body: itemsAsync.when(
+        loading: () => const AppLoadingIndicator(
+          showText: true,
+          text: 'Loading your inventory...',
+        ),
+        error: (error, stack) => _ErrorState(
+          message: 'Failed to load inventory',
+          onRetry: () => ref.invalidate(foodItemsStreamProvider),
+        ),
+        data: (result) {
+          final items = result.getOrElse(() => <FoodItem>[]);
+          // Get settings for thresholds
+          final thresholds = settingsAsync.whenOrNull(
+                data: (s) => s.getOrElse(() => const AppSettings()).thresholds,
+              ) ??
+              ExpiryThresholds.strict;
+
+          // Compute prioritized items (sorted by days left)
+          final prioritized = [...items]
+            ..sort((a, b) => a.daysLeft.compareTo(b.daysLeft));
 
           // Compute all statistics
-          final stats = _computeStats(items, controller);
+          final stats = _computeStats(items, thresholds);
           final recentlyAdded = _getRecentlyAdded(items);
-          final expiringSoon = _getExpiringSoon(items, controller);
+          final expiringSoon = _getExpiringSoon(items, thresholds);
           final categoryStats = _getCategoryStats(items);
+          final consumptionRecordsAsync = ref.watch(consumptionRecordsStreamProvider);
 
           return ListView(
             padding: EdgeInsets.zero,
             children: [
               _SkyHeader(
-                onOpenSettings: onOpenSettings,
-                dailyMessage: dailyMessageFor(DateTime.now()),
+                dailyMessage: app_date_utils.dailyMessageFor(DateTime.now()),
               ),
               Padding(
-                padding: const EdgeInsets.fromLTRB(20, AppSpacing.lg, 20, 32),
+                padding: const EdgeInsets.fromLTRB(
+                  20,
+                  AppSpacing.lg,
+                  20,
+                  32,
+                ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     // Hero Card - Most urgent item
                     _HeroCard(
                       item: prioritized.isEmpty ? null : prioritized.first,
-                      controller: controller,
+                      onMarkUsed: (id) => _markItemUsed(ref, id),
+                      onViewDetail: (item) => _openItemDetail(context, item),
                     ),
                     const SizedBox(height: AppSpacing.xl),
 
@@ -89,8 +100,9 @@ class HomeScreen extends StatelessWidget {
                               const SizedBox(height: AppSpacing.md),
                               _RecentlyAddedList(
                                 items: recentlyAdded,
-                                controller: controller,
-                                onViewAll: onOpenInventory,
+                                onMarkUsed: (id) => _markItemUsed(ref, id),
+                                onViewDetail: (item) => _openItemDetail(context, item),
+                                onViewAll: () => context.go('/inventory'),
                               ),
                             ],
                           ),
@@ -104,8 +116,9 @@ class HomeScreen extends StatelessWidget {
                               const SizedBox(height: AppSpacing.md),
                               _ExpiringSoonList(
                                 items: expiringSoon,
-                                controller: controller,
-                                onViewAll: onOpenInventory,
+                                onMarkUsed: (id) => _markItemUsed(ref, id),
+                                onViewDetail: (item) => _openItemDetail(context, item),
+                                onViewAll: () => context.go('/inventory'),
                               ),
                             ],
                           ),
@@ -129,13 +142,13 @@ class HomeScreen extends StatelessWidget {
                     SectionHeader(
                       title: 'Inventory Health',
                       action: TextButton(
-                        onPressed: onOpenInventory,
+                        onPressed: () => context.go('/inventory'),
                         child: const Text('View all'),
                       ),
                     ),
                     const SizedBox(height: AppSpacing.md),
                     InventoryHealthCard(
-                      onTap: onOpenInventory,
+                      onTap: () => context.go('/inventory'),
                       expiring: stats.expiredItems + stats.expiringSoonItems,
                       soon: stats.expiringSoonItems,
                       safe: stats.safeItems,
@@ -145,9 +158,11 @@ class HomeScreen extends StatelessWidget {
                     // Impact Panel
                     const SectionHeader(title: 'Your Impact'),
                     const SizedBox(height: AppSpacing.md),
-                    ImpactPanel(
-                      stats: ImpactStats.fromRecords(
-                        controller.consumptionRecords,
+                    consumptionRecordsAsync.when(
+                      loading: () => const SizedBox.shrink(),
+                      error: (_, __) => const SizedBox.shrink(),
+                      data: (records) => ImpactPanel(
+                        stats: ImpactStats.fromRecords(records),
                       ),
                     ),
                   ],
@@ -158,33 +173,33 @@ class HomeScreen extends StatelessWidget {
         },
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: () => ItemFormScreen.open(context, controller),
+        onPressed: () => ItemFormScreen.open(context),
         tooltip: 'Add item',
         child: const Icon(Icons.add),
       ),
     );
   }
 
-  // Helper methods to compute statistics
+  // Helper methods
   _DashboardStats _computeStats(
     List<FoodItem> items,
-    InventoryController controller,
+    ExpiryThresholds thresholds,
   ) {
     int safe = 0;
     int expiringSoon = 0;
     int expired = 0;
 
     for (final item in items) {
-      final status = controller.statusOf(item);
+      final status = _classifyItem(item, thresholds);
       switch (status) {
-        case ExpiryStatus.safe:
+        case ExpiryStatus.safe():
           safe++;
           break;
-        case ExpiryStatus.soon:
-        case ExpiryStatus.expiring:
+        case ExpiryStatus.soon():
+        case ExpiryStatus.expiring():
           expiringSoon++;
           break;
-        case ExpiryStatus.expired:
+        case ExpiryStatus.expired():
           expired++;
           break;
       }
@@ -198,6 +213,14 @@ class HomeScreen extends StatelessWidget {
     );
   }
 
+  ExpiryStatus _classifyItem(FoodItem item, ExpiryThresholds thresholds) {
+    final days = item.daysLeft;
+    if (days < 0) return ExpiryStatus.expired();
+    if (days <= thresholds.expiringWithinDays) return ExpiryStatus.expiring();
+    if (days <= thresholds.soonWithinDays) return ExpiryStatus.soon();
+    return ExpiryStatus.safe();
+  }
+
   List<FoodItem> _getRecentlyAdded(List<FoodItem> items) {
     final sorted = List<FoodItem>.from(items)
       ..sort((a, b) => b.id.compareTo(a.id)); // Sort by ID (timestamp-based)
@@ -206,13 +229,12 @@ class HomeScreen extends StatelessWidget {
 
   List<FoodItem> _getExpiringSoon(
     List<FoodItem> items,
-    InventoryController controller,
+    ExpiryThresholds thresholds,
   ) {
-    final expiring = items
-        .where((item) =>
-            controller.statusOf(item) == ExpiryStatus.expiring ||
-            controller.statusOf(item) == ExpiryStatus.soon)
-        .toList();
+    final expiring = items.where((item) {
+      final status = _classifyItem(item, thresholds);
+      return status == ExpiryStatus.expiring() || status == ExpiryStatus.soon();
+    }).toList();
     expiring.sort((a, b) => a.expiryDate.compareTo(b.expiryDate));
     return expiring.take(5).toList();
   }
@@ -227,9 +249,64 @@ class HomeScreen extends StatelessWidget {
       ..sort((a, b) => b.value.compareTo(a.value));
     return Map.fromEntries(sortedEntries.take(6));
   }
+
+  Future<void> _markItemUsed(WidgetRef ref, String id) async {
+    final result = await ref.read(markFoodItemUsedUseCaseProvider)(id);
+    if (!result.isSuccess && ref.context.mounted) {
+      ScaffoldMessenger.of(ref.context).showSnackBar(
+        SnackBar(content: Text('Failed to mark item as used: ${result.failure?.message}')),
+      );
+    }
+  }
+
+  void _openItemDetail(BuildContext context, FoodItem item) {
+    ItemDetailScreen.open(context, item);
+  }
 }
 
-// Data class for dashboard statistics
+/// Error state widget
+class _ErrorState extends StatelessWidget {
+  const _ErrorState({
+    required this.message,
+    required this.onRetry,
+  });
+
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.xl),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.error_outline,
+              size: 64,
+              color: theme.colorScheme.error,
+            ),
+            const SizedBox(height: AppSpacing.md),
+            Text(
+              message,
+              style: theme.textTheme.titleMedium,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: AppSpacing.lg),
+            FilledButton(
+              onPressed: onRetry,
+              child: const Text('Retry'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Data class for dashboard statistics
 class _DashboardStats {
   const _DashboardStats({
     required this.totalItems,
@@ -245,13 +322,11 @@ class _DashboardStats {
 }
 
 /// Sky header with greeting, app title, settings, and daily companion
-class _SkyHeader extends StatelessWidget {
+class _SkyHeader extends ConsumerWidget {
   const _SkyHeader({
-    required this.onOpenSettings,
     required this.dailyMessage,
   });
 
-  final VoidCallback onOpenSettings;
   final String dailyMessage;
 
   static const _textShadow = [
@@ -259,7 +334,7 @@ class _SkyHeader extends StatelessWidget {
   ];
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final topInset = MediaQuery.paddingOf(context).top;
     final hour = DateTime.now().hour;
@@ -301,7 +376,7 @@ class _SkyHeader extends StatelessWidget {
                 ),
                 IconButton(
                   tooltip: 'Settings',
-                  onPressed: onOpenSettings,
+                  onPressed: () => context.go('/settings'),
                   style: IconButton.styleFrom(
                     backgroundColor: const Color.fromARGB(255, 0, 0, 0)
                         .withValues(alpha: 0.2),
@@ -323,10 +398,15 @@ class _SkyHeader extends StatelessWidget {
 
 /// Hero card showing the most urgent item
 class _HeroCard extends StatelessWidget {
-  const _HeroCard({required this.item, required this.controller});
+  const _HeroCard({
+    required this.item,
+    required this.onMarkUsed,
+    required this.onViewDetail,
+  });
 
   final FoodItem? item;
-  final InventoryController controller;
+  final Function(String) onMarkUsed;
+  final Function(FoodItem) onViewDetail;
 
   @override
   Widget build(BuildContext context) {
@@ -343,7 +423,7 @@ class _HeroCard extends StatelessWidget {
   }
 
   Widget _emptyContent(BuildContext context) {
-    return EmptyState(
+    return _EmptyState(
       icon: Icons.eco_outlined,
       message:
           'Nothing tracked yet\nAdd your first item and ExPIRA will tell you what to use first.',
@@ -353,7 +433,7 @@ class _HeroCard extends StatelessWidget {
           foregroundColor: AppColors.brandDeep,
           minimumSize: const Size(48, 48),
         ),
-        onPressed: () => ItemFormScreen.open(context, controller),
+        onPressed: () => ItemFormScreen.open(context),
         child: const Text('Add first item'),
       ),
     );
@@ -391,7 +471,7 @@ class _HeroCard extends StatelessWidget {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    describeDaysLeft(days),
+                    app_date_utils.describeDaysLeft(days),
                     style: theme.textTheme.bodyMedium
                         ?.copyWith(color: Colors.white70),
                   ),
@@ -411,7 +491,7 @@ class _HeroCard extends StatelessWidget {
                   backgroundColor: Colors.white,
                   foregroundColor: AppColors.brandDeep,
                 ),
-                onPressed: () => controller.markUsed(next.id),
+                onPressed: () => onMarkUsed(next.id),
                 child: const Text('Mark as used'),
               ),
             ),
@@ -421,8 +501,7 @@ class _HeroCard extends StatelessWidget {
                 foregroundColor: Colors.white,
                 side: const BorderSide(color: Colors.white54),
               ),
-              onPressed: () =>
-                  ItemDetailScreen.open(context, controller, next),
+              onPressed: () => onViewDetail(next),
               child: const Text('View Item'),
             ),
           ],
@@ -529,12 +608,14 @@ class _DaysRingState extends State<_DaysRing>
 class _RecentlyAddedList extends StatelessWidget {
   const _RecentlyAddedList({
     required this.items,
-    required this.controller,
+    required this.onMarkUsed,
+    required this.onViewDetail,
     required this.onViewAll,
   });
 
   final List<FoodItem> items;
-  final InventoryController controller;
+  final Function(String) onMarkUsed;
+  final Function(FoodItem) onViewDetail;
   final VoidCallback onViewAll;
 
   @override
@@ -562,7 +643,8 @@ class _RecentlyAddedList extends StatelessWidget {
           for (int i = 0; i < items.length; i++) ...[
             _MiniItemTile(
               item: items[i],
-              controller: controller,
+              onMarkUsed: onMarkUsed,
+              onViewDetail: onViewDetail,
               showDivider: i < items.length - 1,
             ),
           ],
@@ -580,12 +662,14 @@ class _RecentlyAddedList extends StatelessWidget {
 class _ExpiringSoonList extends StatelessWidget {
   const _ExpiringSoonList({
     required this.items,
-    required this.controller,
+    required this.onMarkUsed,
+    required this.onViewDetail,
     required this.onViewAll,
   });
 
   final List<FoodItem> items;
-  final InventoryController controller;
+  final Function(String) onMarkUsed;
+  final Function(FoodItem) onViewDetail;
   final VoidCallback onViewAll;
 
   @override
@@ -624,7 +708,8 @@ class _ExpiringSoonList extends StatelessWidget {
           for (int i = 0; i < items.length; i++) ...[
             _MiniItemTile(
               item: items[i],
-              controller: controller,
+              onMarkUsed: onMarkUsed,
+              onViewDetail: onViewDetail,
               showDivider: i < items.length - 1,
             ),
           ],
@@ -642,22 +727,24 @@ class _ExpiringSoonList extends StatelessWidget {
 class _MiniItemTile extends StatelessWidget {
   const _MiniItemTile({
     required this.item,
-    required this.controller,
+    required this.onMarkUsed,
+    required this.onViewDetail,
     this.showDivider = true,
   });
 
   final FoodItem item;
-  final InventoryController controller;
+  final Function(String) onMarkUsed;
+  final Function(FoodItem) onViewDetail;
   final bool showDivider;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final status = controller.statusOf(item);
-    final statusColor = status.colorFor(theme.brightness);
+    final status = item.status;
+    final statusColor = _statusColor(status, theme.brightness);
 
     return InkWell(
-      onTap: () => ItemDetailScreen.open(context, controller, item),
+      onTap: () => onViewDetail(item),
       child: Padding(
         padding: const EdgeInsets.all(AppSpacing.md),
         child: Column(
@@ -673,7 +760,7 @@ class _MiniItemTile extends StatelessWidget {
                     borderRadius: BorderRadius.circular(AppRadius.control),
                   ),
                   child: Icon(
-                    item.location?.icon ?? Icons.inventory_2_outlined,
+                    _locationIcon(item.location),
                     color: statusColor,
                     size: 20,
                   ),
@@ -722,7 +809,7 @@ class _MiniItemTile extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      describeDaysLeft(item.daysLeft),
+                      app_date_utils.describeDaysLeft(item.daysLeft),
                       style: theme.textTheme.labelSmall?.copyWith(
                         color: statusColor,
                         fontWeight: FontWeight.w600,
@@ -741,6 +828,26 @@ class _MiniItemTile extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  Color _statusColor(ExpiryStatus status, Brightness brightness) {
+    return switch (status) {
+      ExpiryStatus.expired() => AppColors.expiring,
+      ExpiryStatus.expiring() => AppColors.expiring,
+      ExpiryStatus.soon() => AppColors.soon,
+      ExpiryStatus.safe() => AppColors.safe,
+    };
+  }
+
+  IconData _locationIcon(StorageLocation location) {
+    return switch (location) {
+      StorageLocation.fridge() => Icons.kitchen_outlined,
+      StorageLocation.freezer() => Icons.ac_unit,
+      StorageLocation.pantry() => Icons.shelves,
+      StorageLocation.bathroom() => Icons.bathtub_outlined,
+      StorageLocation.beautyProducts() => Icons.spa_outlined,
+      StorageLocation.other() => Icons.inventory_2_outlined,
+    };
   }
 }
 
@@ -833,9 +940,45 @@ class _CategoryBreakdown extends StatelessWidget {
                 ],
               )
           );
-      }),
+        }),
         ],
       ),
+    );
+  }
+}
+
+/// Local empty state widget to avoid conflict with widgets/empty_state.dart
+class _EmptyState extends StatelessWidget {
+  const _EmptyState({
+    required this.icon,
+    required this.message,
+    this.action,
+  });
+
+  final IconData icon;
+  final String message;
+  final Widget? action;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 48, color: theme.colorScheme.onSurfaceVariant),
+        const SizedBox(height: AppSpacing.md),
+        Text(
+          message,
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        if (action != null) ...[
+          const SizedBox(height: AppSpacing.lg),
+          action!,
+        ],
+      ],
     );
   }
 }

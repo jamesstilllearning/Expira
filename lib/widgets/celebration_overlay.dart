@@ -3,7 +3,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
-import '../controllers/settings_controller.dart';
+import '../models/app_settings.dart';
 import '../models/consumption_record.dart';
 import '../theme/app_colors.dart';
 import 'pop_in.dart';
@@ -21,7 +21,7 @@ class CelebrationOverlay extends StatefulWidget {
   static const message = 'Nice work! Item used.';
 
   final Stream<ConsumptionRecord> consumptions;
-  final SettingsController settings;
+  final AppSettings settings;
   final Widget child;
 
   @override
@@ -60,7 +60,7 @@ class _CelebrationOverlayState extends State<CelebrationOverlay>
   }
 
   void _onConsumed(ConsumptionRecord _) {
-    if (!widget.settings.settings.celebrationEffects) return;
+    if (!widget.settings.celebrationEffects) return;
     if (_animation.isAnimating) return;
 
     final isDark = Theme.of(context).brightness == Brightness.dark;

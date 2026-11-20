@@ -1,0 +1,7 @@
+targets:
+  $default:
+    sources:
+      - "lib/domain/**"
+      - "lib/di/**"
+      - "lib/presentation/providers/**"
+      - "lib/presentation/screens/**"

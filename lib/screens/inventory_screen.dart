@@ -1,13 +1,24 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
-import '../controllers/inventory_controller.dart';
-import '../models/food_item.dart';
-import '../models/location_groups.dart';
+import '../core/constants/app_constants.dart';
+import '../core/utils/date_utils.dart' as app_date_utils;
+import '../domain/models/expiry_status.dart';
+import '../domain/models/food_item.dart'
+    hide ExpiryStatus;
+import '../domain/models/location_groups.dart';
+import '../presentation/providers/state_providers.dart'
+    hide ExpiryStatus;
+import '../presentation/providers/usecase_providers.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_loading_indicator.dart';
-import '../widgets/empty_state.dart';
+import '../widgets/empty_state.dart'
+    hide EmptyState;
 import '../widgets/item_card.dart';
+import '../widgets/pop_in.dart';
+import '../widgets/section_header.dart';
 import 'barcode_scanner_screen.dart';
 import 'item_form_screen.dart';
 import 'product_review_screen.dart';
@@ -15,38 +26,29 @@ import '../services/product_lookup_service.dart';
 
 enum _SortMode { expiry, name, category }
 
-class InventoryScreen extends StatefulWidget {
-  const InventoryScreen(
-      {super.key,
-      required this.controller,
-      this.onOpenSettings,
-      this.onOpenNotifications});
-
-  final InventoryController controller;
-
-  /// Opens Settings from the header. Omit to hide the button.
-  final VoidCallback? onOpenSettings;
-  final VoidCallback? onOpenNotifications;
+/// Inventory screen using Riverpod for state management and go_router for navigation.
+class InventoryScreen extends ConsumerStatefulWidget {
+  const InventoryScreen({super.key});
 
   @override
-  State<InventoryScreen> createState() => _InventoryScreenState();
+  ConsumerState<InventoryScreen> createState() => _InventoryScreenState();
 }
 
-class _InventoryScreenState extends State<InventoryScreen> {
+class _InventoryScreenState extends ConsumerState<InventoryScreen> {
   String _query = '';
   ExpiryStatus? _statusFilter;
   _SortMode _sort = _SortMode.expiry;
   bool _groupByLocation = false;
 
-  List<FoodItem> _visibleItems() {
+  List<FoodItem> _visibleItems(List<FoodItem> items) {
     final query = _query.trim().toLowerCase();
-    final items = widget.controller.items.where((item) {
+    final filtered = items.where((item) {
       final matchesText = query.isEmpty ||
           item.name.toLowerCase().contains(query) ||
           item.category.toLowerCase().contains(query) ||
-          (item.location?.label.toLowerCase().contains(query) ?? false);
+          (item.location.label.toLowerCase().contains(query));
       final matchesStatus = _statusFilter == null ||
-          widget.controller.statusOf(item) == _statusFilter;
+          item.status == _statusFilter;
       return matchesText && matchesStatus;
     }).toList();
 
@@ -56,8 +58,8 @@ class _InventoryScreenState extends State<InventoryScreen> {
           a.name.toLowerCase().compareTo(b.name.toLowerCase()),
       _SortMode.category => (a, b) => a.category.compareTo(b.category),
     };
-    items.sort(comparator);
-    return items;
+    filtered.sort(comparator);
+    return filtered;
   }
 
   Future<void> _scanAndAdd(BuildContext context) async {
@@ -66,28 +68,33 @@ class _InventoryScreenState extends State<InventoryScreen> {
 
     final product = await ProductLookupService().lookup(barcode);
     if (!context.mounted) return;
-    final matches = widget.controller.items.where((item) => item.barcode == barcode);
+
+    final getByBarcodeUseCase = ref.read(getFoodItemsByBarcodeUseCaseProvider);
+    final result = await getByBarcodeUseCase(barcode);
+    final matches = result.getOrElse(<FoodItem>[]);
+
     if (matches.isNotEmpty) {
-      await ItemFormScreen.open(context, widget.controller,
-          item: matches.first);
+      if (context.mounted) {
+        ItemFormScreen.open(context, item: matches.first);
+      }
     } else {
       // Show product review screen first
-      await ProductReviewScreen.open(
-        context,
-        controller: widget.controller,
-        barcode: barcode,
-        product: product,
-        onEdit: () {
-          // User wants to edit before saving - open form with pre-filled data
-          ItemFormScreen.open(context, widget.controller,
-              initialBarcode: barcode, initialProduct: product);
-        },
-      );
+      if (context.mounted) {
+        await ProductReviewScreen.open(
+          context,
+          barcode: barcode,
+          product: product,
+          onEdit: () {
+            // User wants to edit before saving - open form with pre-filled data
+            ItemFormScreen.open(context,
+                initialBarcode: barcode, initialProduct: product);
+          },
+        );
+      }
     }
   }
 
   Widget _itemCard(BuildContext context, FoodItem item) {
-    final controller = widget.controller;
     final theme = Theme.of(context);
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
@@ -112,18 +119,18 @@ class _InventoryScreenState extends State<InventoryScreen> {
             ],
           ),
         ),
-        confirmDismiss: (_) => confirmAction(
+        confirmDismiss: (_) => _confirmAction(
           context,
           title: 'Delete item?',
           message: 'Remove "${item.name}" from your inventory?',
           confirmLabel: 'Delete',
         ),
-        onDismissed: (_) => controller.delete(item.id),
+        onDismissed: (_) => _deleteItem(item.id),
         child: ItemCard(
           item: item,
-          status: controller.statusOf(item),
-          onTap: () => ItemFormScreen.open(context, controller, item: item),
-          onMarkUsed: () => controller.markUsed(item.id),
+          status: item.status,
+          onTap: () => ItemFormScreen.open(context, item: item),
+          onMarkUsed: () => _markItemUsed(item.id),
         ),
       ),
     );
@@ -131,11 +138,13 @@ class _InventoryScreenState extends State<InventoryScreen> {
 
   Widget _buildList(BuildContext context, List<FoodItem> items) {
     if (items.isEmpty) {
-      return EmptyState(
-        icon: widget.controller.items.isEmpty
+      final allItemsAsync = ref.watch(foodItemsStreamProvider);
+      final allItemsResult = allItemsAsync.value?.getOrElse(<FoodItem>[]) ?? <FoodItem>[];
+      return _EmptyState(
+        icon: allItemsResult.isEmpty
             ? Icons.kitchen_outlined
             : Icons.search_off,
-        message: widget.controller.items.isEmpty
+        message: allItemsResult.isEmpty
             ? 'Your inventory is empty.\nAdd an item or scan a barcode to begin.'
             : 'No items match your search or filter.',
       );
@@ -162,24 +171,73 @@ class _InventoryScreenState extends State<InventoryScreen> {
     );
   }
 
+  Future<void> _markItemUsed(String id) async {
+    final result = await ref.read(markFoodItemUsedUseCaseProvider)(id);
+    if (!result.isSuccess && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to mark item as used: ${result.failure?.message}')),
+      );
+    }
+  }
+
+  Future<void> _deleteItem(String id) async {
+    final result = await ref.read(deleteFoodItemUseCaseProvider)(id);
+    if (!result.isSuccess && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to delete item: ${result.failure?.message}')),
+      );
+    }
+  }
+
+  Future<bool> _confirmAction(
+    BuildContext context, {
+    required String title,
+    required String message,
+    required String confirmLabel,
+  }) async {
+    return await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: Text(title),
+            content: Text(message),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: Text(confirmLabel),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
   @override
   Widget build(BuildContext context) {
-    final controller = widget.controller;
+    final itemsAsync = ref.watch(foodItemsStreamProvider);
 
     return Scaffold(
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => ItemFormScreen.open(context, controller),
+        onPressed: () => ItemFormScreen.open(context),
         icon: const Icon(Icons.add),
         label: const Text('Add item'),
       ),
-      body: ListenableBuilder(
-        listenable: controller,
-        builder: (context, _) {
-          if (!controller.isLoaded) {
-            return const AppLoadingIndicator(showText: true, text: 'Loading inventory...');
-          }
-          final items = _visibleItems();
-          final total = controller.items.length;
+      body: itemsAsync.when(
+        loading: () => const AppLoadingIndicator(
+          showText: true,
+          text: 'Loading inventory...',
+        ),
+        error: (error, stack) => _ErrorState(
+          message: 'Failed to load inventory',
+          onRetry: () => ref.invalidate(foodItemsStreamProvider),
+        ),
+        data: (result) {
+          final items = result.getOrElse(<FoodItem>[]);
+          final visibleItems = _visibleItems(items);
+          final total = items.length;
 
           return SafeArea(
             bottom: false,
@@ -190,8 +248,8 @@ class _InventoryScreenState extends State<InventoryScreen> {
                   sort: _sort,
                   onSortChanged: (mode) => setState(() => _sort = mode),
                   onScan: () => _scanAndAdd(context),
-                  onOpenSettings: widget.onOpenSettings,
-                  onOpenNotifications: widget.onOpenNotifications,
+                  onOpenSettings: () => context.go('/settings'),
+                  onOpenNotifications: () => context.go('/notifications'),
                 ),
                 Padding(
                   padding: const EdgeInsets.fromLTRB(20, 18, 20, 12),
@@ -224,10 +282,10 @@ class _InventoryScreenState extends State<InventoryScreen> {
                         selected: _statusFilter == null,
                         onTap: () => setState(() => _statusFilter = null),
                       ),
-                      for (final status in ExpiryStatus.values)
+                      for (final status in ExpiryStatus.allInPriorityOrder)
                         _StatusChip(
                           label: status.label,
-                          color: status.colorFor(Theme.of(context).brightness),
+                          color: _statusColor(status, Theme.of(context).brightness),
                           selected: _statusFilter == status,
                           onTap: () => setState(() => _statusFilter = status),
                         ),
@@ -237,13 +295,13 @@ class _InventoryScreenState extends State<InventoryScreen> {
                 Padding(
                   padding: const EdgeInsets.fromLTRB(20, 14, 20, 10),
                   child: Text(
-                    _summary(items.length, total),
+                    _summary(visibleItems.length, total),
                     style: Theme.of(context).textTheme.labelMedium?.copyWith(
                           color: Theme.of(context).colorScheme.onSurfaceVariant,
                         ),
                   ),
                 ),
-                Expanded(child: _buildList(context, items)),
+                Expanded(child: _buildList(context, visibleItems)),
               ],
             ),
           );
@@ -255,6 +313,57 @@ class _InventoryScreenState extends State<InventoryScreen> {
   String _summary(int shown, int total) {
     final noun = total == 1 ? 'item' : 'items';
     return shown == total ? '$total $noun' : '$shown of $total $noun';
+  }
+
+  Color _statusColor(ExpiryStatus status, Brightness brightness) {
+    return switch (status) {
+      ExpiryStatus.expired() => AppColors.expiring,
+      ExpiryStatus.expiring() => AppColors.expiring,
+      ExpiryStatus.soon() => AppColors.soon,
+      ExpiryStatus.safe() => AppColors.safe,
+    };
+  }
+}
+
+/// Error state widget
+class _ErrorState extends StatelessWidget {
+  const _ErrorState({
+    required this.message,
+    required this.onRetry,
+  });
+
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.xl),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.error_outline,
+              size: 64,
+              color: theme.colorScheme.error,
+            ),
+            const SizedBox(height: AppSpacing.md),
+            Text(
+              message,
+              style: theme.textTheme.titleMedium,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: AppSpacing.lg),
+            FilledButton(
+              onPressed: onRetry,
+              child: const Text('Retry'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -545,6 +654,41 @@ class _LocationSection extends StatelessWidget {
             ),
             children: [for (final item in group.items) itemBuilder(item)],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Local empty state widget to avoid conflict with widgets/empty_state.dart
+class _EmptyState extends StatelessWidget {
+  const _EmptyState({
+    required this.icon,
+    required this.message,
+  });
+
+  final IconData icon;
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.xl),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 48, color: theme.colorScheme.onSurfaceVariant),
+            const SizedBox(height: AppSpacing.md),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
         ),
       ),
     );
